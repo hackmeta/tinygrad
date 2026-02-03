@@ -3577,8 +3577,22 @@ class Tensor(OpMixin):
     assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
 
     if getenv("FLASH_ATTENTION"):
-      from extra.thunder.tiny.fa import flash_attention
-      return flash_attention(self, key, value, attn_mask=attn_mask, is_causal=is_causal)
+      # Use device-specific flash attention if conditions are met
+      # CUDA FA requires: D=64, N%16==0, no attn_mask
+      N, D = self.shape[-2], self.shape[-1]
+      can_use_cuda_fa = (self.device and "CUDA" in str(self.device) and
+                         D == 64 and N >= 64 and N % 64 == 0 and attn_mask is None)
+      if can_use_cuda_fa:
+        from extra.thunder.cuda.flash_attention import flash_attention as cuda_fa
+        q_t = self.transpose(1, 2).contiguous()
+        k_t = key.transpose(1, 2).contiguous()
+        v_t = value.transpose(1, 2).contiguous()
+        out = cuda_fa(q_t, k_t, v_t, attn_mask=attn_mask, is_causal=is_causal)
+        return out.transpose(1, 2).contiguous()
+      elif self.device and "AMD" in str(self.device):
+        from extra.thunder.tiny.fa import flash_attention
+        return flash_attention(self, key, value, attn_mask=attn_mask, is_causal=is_causal)
+      # else: fallback to standard SDPA below
 
     # GQA: https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
     if enable_gqa:
